@@ -8,12 +8,20 @@ import {
   LogOut, 
   Users,
   Circle,
-  MoreVertical
+  MoreVertical,
+  X
 } from 'lucide-react';
 import { useAuth } from '../../services/authContext';
 import { usersAPI, messagesAPI } from '../../services/api';
-import { socketService, SocketMessage, OnlineUser, TypingEvent } from '../../services/socketService';
+import { socketService, SocketMessage, OnlineUser, TypingEvent, UserStatus } from '../../services/socketService';
 import { User as UserType, Message } from '../../types/types';
+
+interface Notification {
+  id: string;
+  message: string;
+  type: 'login' | 'logout';
+  timestamp: number;
+}
 
 const Chat: React.FC = () => {
   const { user, logout, token } = useAuth();
@@ -24,6 +32,7 @@ const Chat: React.FC = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [isTyping, setIsTyping] = useState<{ [userId: string]: boolean }>({});
   const [loading, setLoading] = useState(true);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -36,74 +45,190 @@ const Chat: React.FC = () => {
     scrollToBottom();
   }, [messages]);
 
+  // Add notification function with duplicate prevention
+  const addNotification = (message: string, type: 'login' | 'logout') => {
+    // Check if the same notification already exists in the last 2 seconds
+    const now = Date.now();
+    const isDuplicate = notifications.some(n => 
+      n.message === message && 
+      n.type === type && 
+      (now - n.timestamp) < 2000
+    );
+    
+    if (isDuplicate) {
+      console.log("Duplicate notification prevented:", message);
+      return;
+    }
+
+    const notification: Notification = {
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+      message,
+      type,
+      timestamp: now
+    };
+    
+    console.log("Adding notification:", notification);
+    setNotifications(prev => [...prev, notification]);
+    
+    // Auto remove notification after 5 seconds
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== notification.id));
+    }, 5000);
+  };
+
+  // Remove notification manually
+  const removeNotification = (id: string) => {
+    setNotifications(prev => prev.filter(n => n.id !== id));
+  };
+
   // Initialize socket connection
   useEffect(() => {
     if (!token || !user) return;
 
+    let isComponentMounted = true;
+
     const initSocket = async () => {
       try {
+        console.log("Initializing socket for user:", user.username);
         await socketService.connect(token);
+        
+        if (!isComponentMounted) return;
         setIsConnected(true);
         
-        // Get initial online users
-        socketService.getOnlineUsers();
-        
-        // Set up event listeners
-        socketService.onMessageReceive((message: SocketMessage) => {
-          setMessages(prev => [...prev, message]);
-        });
+        // Define event handlers
+        const handleMessageReceive = (message: SocketMessage) => {
+          if (isComponentMounted) {
+            setMessages(prev => [...prev, message]);
+          }
+        };
 
-        socketService.onMessageSent((message: SocketMessage) => {
-          setMessages(prev => [...prev, message]);
-        });
+        const handleMessageSent = (message: SocketMessage) => {
+          if (isComponentMounted) {
+            setMessages(prev => [...prev, message]);
+          }
+        };
 
-        socketService.onUsersOnline((users: OnlineUser[]) => {
-          // Filter out current user
-          const filteredUsers = users.filter(u => u.id !== user.id);
-          setOnlineUsers(filteredUsers);
-          setLoading(false);
-        });
+        const handleUsersOnline = (users: OnlineUser[]) => {
+          if (isComponentMounted) {
+            console.log("Online users updated:", users);
+            // Filter out current user
+            const filteredUsers = users.filter(u => u.id !== user.id);
+            setOnlineUsers(filteredUsers);
+            setLoading(false);
+          }
+        };
 
-        socketService.onUserStatus((status) => {
+        const handleUserStatus = (status: UserStatus) => {
+          if (!isComponentMounted) return;
+          console.log("User status change:", status);
+          
           setOnlineUsers(prev => {
+            const userExists = prev.find(u => u.id === status.userId);
+            
             if (status.status === 'ONLINE') {
               // Add user if not already in list and not current user
-              if (!prev.find(u => u.id === status.userId) && status.userId !== user.id) {
+              if (!userExists && status.userId !== user.id) {
+                // Show login notification
+                addNotification(`${status.username} joined the chat`, 'login');
                 return [...prev, { 
                   id: status.userId, 
                   username: status.username, 
-                  email: '', 
                   status: 'ONLINE' 
                 }];
               }
             } else {
-              // Remove user from online list
-              return prev.filter(u => u.id !== status.userId);
+              // Show logout notification if user was in the list
+              if (userExists) {
+                addNotification(`${status.username} left the chat`, 'logout');
+                return prev.filter(u => u.id !== status.userId);
+              }
             }
             return prev;
           });
-        });
+        };
 
-        socketService.onTypingStart((data: TypingEvent) => {
-          setIsTyping(prev => ({ ...prev, [data.userId]: true }));
-        });
+        const handleTypingStart = (data: TypingEvent) => {
+          if (isComponentMounted) {
+            setIsTyping(prev => ({ ...prev, [data.userId]: true }));
+          }
+        };
 
-        socketService.onTypingStop((data: TypingEvent) => {
-          setIsTyping(prev => ({ ...prev, [data.userId]: false }));
-        });
+        const handleTypingStop = (data: TypingEvent) => {
+          if (isComponentMounted) {
+            setIsTyping(prev => ({ ...prev, [data.userId]: false }));
+          }
+        };
 
+        // Remove any existing listeners first
+        socketService.off('message:receive');
+        socketService.off('message:sent');
+        socketService.off('users:online');
+        socketService.off('user:status');
+        socketService.off('typing:start');
+        socketService.off('typing:stop');
+
+        // Set up event listeners
+        socketService.onMessageReceive(handleMessageReceive);
+        socketService.onMessageSent(handleMessageSent);
+        socketService.onUsersOnline(handleUsersOnline);
+        socketService.onUserStatus(handleUserStatus);
+        socketService.onTypingStart(handleTypingStart);
+        socketService.onTypingStop(handleTypingStop);
+
+        setLoading(false);
       } catch (error) {
         console.error('Failed to connect to socket:', error);
-        setLoading(false);
+        if (isComponentMounted) {
+          setIsConnected(false);
+          setLoading(false);
+        }
       }
     };
 
     initSocket();
 
     return () => {
+      console.log("Cleaning up socket connection for user:", user.username);
+      isComponentMounted = false;
+      
+      // Clean up event listeners
+      socketService.off('message:receive');
+      socketService.off('message:sent');
+      socketService.off('users:online');
+      socketService.off('user:status');
+      socketService.off('typing:start');
+      socketService.off('typing:stop');
+      
       socketService.disconnect();
     };
   }, [token, user]);
+
+  // Periodic online users refresh and auto-refresh on user status changes
+  useEffect(() => {
+    if (!isConnected) return;
+
+    const interval = setInterval(() => {
+      if (socketService.isConnected()) {
+        console.log("Periodic refresh of online users");
+        socketService.getOnlineUsers();
+      }
+    }, 15000); // Refresh every 15 seconds
+
+    return () => clearInterval(interval);
+  }, [isConnected]);
+
+  // Auto-refresh users list when notifications are added (user joins/leaves)
+  useEffect(() => {
+    if (notifications.length > 0 && isConnected) {
+      // Small delay to allow server to process the user status change
+      setTimeout(() => {
+        if (socketService.isConnected()) {
+          console.log("Auto-refreshing users after status change");
+          socketService.getOnlineUsers();
+        }
+      }, 1000);
+    }
+  }, [notifications.length, isConnected]);
 
   // Load chat history when user is selected
   useEffect(() => {
@@ -188,6 +313,33 @@ const Chat: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-gray-100">
+      {/* Notifications */}
+      <div className="fixed top-4 right-4 z-50 space-y-2">
+        {notifications.map((notification) => (
+          <div
+            key={notification.id}
+            className={`flex items-center justify-between p-4 rounded-lg shadow-lg min-w-80 ${
+              notification.type === 'login' 
+                ? 'bg-green-100 border border-green-200 text-green-800' 
+                : 'bg-orange-100 border border-orange-200 text-orange-800'
+            } animate-slide-in`}
+          >
+            <div className="flex items-center space-x-3">
+              <div className={`w-2 h-2 rounded-full ${
+                notification.type === 'login' ? 'bg-green-500' : 'bg-orange-500'
+              }`}></div>
+              <span className="font-medium">{notification.message}</span>
+            </div>
+            <button
+              onClick={() => removeNotification(notification.id)}
+              className="text-gray-500 hover:text-gray-700 ml-4"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        ))}
+      </div>
+
       {/* Sidebar - Users List */}
       <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
         {/* Header */}
@@ -207,12 +359,21 @@ const Chat: React.FC = () => {
                 </div>
               </div>
             </div>
-            <button
-              onClick={handleLogout}
-              className="p-2 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors"
-            >
-              <LogOut className="w-5 h-5" />
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => socketService.getOnlineUsers()}
+                className="p-2 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors"
+                title="Refresh online users"
+              >
+                <Users className="w-4 h-4" />
+              </button>
+              <button
+                onClick={handleLogout}
+                className="p-2 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -230,6 +391,12 @@ const Chat: React.FC = () => {
               <div className="text-center py-8">
                 <Users className="w-12 h-12 text-gray-300 mx-auto mb-2" />
                 <p className="text-gray-500 text-sm">No other users online</p>
+                <button
+                  onClick={() => socketService.getOnlineUsers()}
+                  className="mt-2 text-blue-600 hover:text-blue-700 text-sm"
+                >
+                  Refresh
+                </button>
               </div>
             ) : (
               <div className="space-y-2">
@@ -374,6 +541,22 @@ const Chat: React.FC = () => {
           </div>
         )}
       </div>
+
+      <style>{`
+        @keyframes slide-in {
+          from {
+            transform: translateX(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+        .animate-slide-in {
+          animation: slide-in 0.3s ease-out;
+        }
+      `}</style>
     </div>
   );
 };
